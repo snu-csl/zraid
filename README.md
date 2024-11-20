@@ -5,7 +5,7 @@
 ZRAID is a software RAID driver for ZNS SSDs. It is implemented as a Linux kernel module providing the system with an abstraction of unified ZNS-interface SSD.
 
 Further details on the design and implementation of NVMeVirt can be found in the following papers.
-- [NVMeVirt: A Versatile Software-defined Virtual NVMe Device (ASPLOS 2025)]
+- [ZRAID: Leveraging Zone Random Write Area (ZRWA) for Alleviating Partial Parity Tax in ZNS RAID (ASPLOS 2025)]
 
 
 ## Installation
