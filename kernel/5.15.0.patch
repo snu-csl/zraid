@@ -1,0 +1,277 @@
+diff --git a/Makefile b/Makefile
+index ed6e7ec60eff..fe9dd5930fa9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 15
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = -po2-nvm
+ NAME = Trick or Treat
+ 
+ # *DOCUMENTATION*
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 4d8f5fe91588..623b5176e8b7 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -773,7 +773,8 @@ static inline blk_status_t blk_check_zone_append(struct request_queue *q,
+ 		return BLK_STS_NOTSUPP;
+ 
+ 	/* The bio sector must point to the start of a sequential zone */
+-	if (pos & (blk_queue_zone_sectors(q) - 1) ||
++	//if (pos & (blk_queue_zone_sectors(q) - 1) ||
++    if (!bdev_is_zone_aligned(bio->bi_bdev, bio->bi_iter.bi_sector) ||
+ 	    !blk_queue_zone_is_seq(q, pos))
+ 		return BLK_STS_IOERR;
+ 
+diff --git a/block/blk-zoned.c b/block/blk-zoned.c
+index 1d0c76c18fc5..054bbcc708fa 100644
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@ -118,10 +118,14 @@ EXPORT_SYMBOL_GPL(__blk_req_zone_write_unlock);
+ unsigned int blkdev_nr_zones(struct gendisk *disk)
+ {
+ 	sector_t zone_sectors = blk_queue_zone_sectors(disk->queue);
++    sector_t capacity = get_capacity(disk);
+ 
+ 	if (!blk_queue_is_zoned(disk->queue))
+ 		return 0;
+-	return (get_capacity(disk) + zone_sectors - 1) >> ilog2(zone_sectors);
++	if (is_power_of_2(zone_sectors))
++		return (capacity + zone_sectors - 1) >> ilog2(zone_sectors);
++
++	return DIV_ROUND_UP_SECTOR_T(capacity, zone_sectors);
+ }
+ EXPORT_SYMBOL_GPL(blkdev_nr_zones);
+ 
+@@ -287,10 +291,12 @@ int blkdev_zone_mgmt(struct block_device *bdev, enum req_opf op,
+ 		return -EINVAL;
+ 
+ 	/* Check alignment (handle eventual smaller last zone) */
+-	if (sector & (zone_sectors - 1))
++	//if (sector & (zone_sectors - 1))
++    if (!bdev_is_zone_aligned(bdev, sector))
+ 		return -EINVAL;
+ 
+-	if ((nr_sectors & (zone_sectors - 1)) && end_sector != capacity)
++	//if ((nr_sectors & (zone_sectors - 1)) && end_sector != capacity)
++    if (!bdev_is_zone_aligned(bdev, nr_sectors) && end_sector != capacity)
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -495,14 +501,28 @@ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
+ 	 * smaller last zone.
+ 	 */
+ 	if (zone->start == 0) {
+-		if (zone->len == 0 || !is_power_of_2(zone->len)) {
+-			pr_warn("%s: Invalid zoned device with non power of two zone size (%llu)\n",
+-				disk->disk_name, zone->len);
++
++		if (zone->len == 0) {
++			pr_warn("%s: Invalid zone size", disk->disk_name);
++			return -ENODEV;
++		}
++
++		/*
++		 * Non power-of-2 zone size support was added to remove the
++		 * gap between zone capacity and zone size. Though it is technically
++		 * possible to have gaps in a non power-of-2 device, Linux requires
++		 * the zone size to be equal to zone capacity for non power-of-2
++		 * zoned devices.
++		 */
++		if (!is_power_of_2(zone->len) && zone->capacity < zone->len) {
++			pr_warn("%s: Invalid zone capacity for non power of 2 zone size",
++				disk->disk_name);
+ 			return -ENODEV;
+ 		}
+ 
+ 		args->zone_sectors = zone->len;
+-		args->nr_zones = (capacity + zone->len - 1) >> ilog2(zone->len);
++		//args->nr_zones = (capacity + zone->len - 1) >> ilog2(zone->len)
++		args->nr_zones = div64_u64(capacity + zone->len - 1, zone->len);
+ 	} else if (zone->start + args->zone_sectors < capacity) {
+ 		if (zone->len != args->zone_sectors) {
+ 			pr_warn("%s: Invalid zoned device with non constant zone size\n",
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 2111daaacaba..52409fcc885a 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -715,6 +715,7 @@ int dm_table_add_target(struct dm_table *t, const char *type,
+ 	if (r)
+ 		goto bad;
+ 	
++
+ 	t->highs[t->num_targets++] = tgt->begin + tgt->len - 1;
+ 
+ 	if (!tgt->num_discard_bios && tgt->discards_supported)
+@@ -1632,14 +1633,16 @@ static int validate_hardware_zoned_model(struct dm_table *table,
+ 	}
+ 
+ 	/* Check zone size validity and compatibility */
++	/*
+ 	if (!zone_sectors || !is_power_of_2(zone_sectors))
+ 		return -EINVAL;
++	*/
+ 
+-	if (dm_table_any_dev_attr(table, device_not_matches_zone_sectors, &zone_sectors)) {
++	/*if (dm_table_any_dev_attr(table, device_not_matches_zone_sectors, &zone_sectors)) {
+ 		DMERR("%s: zone sectors is not consistent across all zoned devices",
+ 		      dm_device_name(table->md));
+ 		return -EINVAL;
+-	}
++	}*/
+ 
+ 	return 0;
+ }
+diff --git a/drivers/nvme/host/zns.c b/drivers/nvme/host/zns.c
+index d95010481fce..9459d420bab2 100644
+--- a/drivers/nvme/host/zns.c
++++ b/drivers/nvme/host/zns.c
+@@ -101,13 +101,13 @@ int nvme_update_zone_info(struct nvme_ns *ns, unsigned lbaf)
+ 	}
+ 
+ 	ns->zsze = nvme_lba_to_sect(ns, le64_to_cpu(id->lbafe[lbaf].zsze));
+-	if (!is_power_of_2(ns->zsze)) {
++	/*if (!is_power_of_2(ns->zsze)) {
+ 		dev_warn(ns->ctrl->device,
+ 			"invalid zone size:%llu for namespace:%u\n",
+ 			ns->zsze, ns->head->ns_id);
+ 		status = -ENODEV;
+ 		goto free_data;
+-	}
++	}*/
+ 
+ 	blk_queue_set_zoned(ns->disk, BLK_ZONED_HM);
+ 	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
+@@ -129,7 +129,8 @@ static void *nvme_zns_alloc_report_buffer(struct nvme_ns *ns,
+ 				   sizeof(struct nvme_zone_descriptor);
+ 
+ 	nr_zones = min_t(unsigned int, nr_zones,
+-			 get_capacity(ns->disk) >> ilog2(ns->zsze));
++			 //get_capacity(ns->disk) >> ilog2(ns->zsze));
++                div64_u64(get_capacity(ns->disk), ns->zsze));
+ 
+ 	bufsize = sizeof(struct nvme_zone_report) +
+ 		nr_zones * sizeof(struct nvme_zone_descriptor);
+@@ -179,6 +180,7 @@ int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
+ 	int ret, zone_idx = 0;
+ 	unsigned int nz, i;
+ 	size_t buflen;
++    u64 remainder = 0;
+ 
+ 	if (ns->head->ids.csi != NVME_CSI_ZNS)
+ 		return -EINVAL;
+@@ -194,7 +196,9 @@ int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
+ 	c.zmr.zrasf = NVME_ZRASF_ZONE_REPORT_ALL;
+ 	c.zmr.pr = NVME_REPORT_ZONE_PARTIAL;
+ 
+-	sector &= ~(ns->zsze - 1);
++	//sector &= ~(ns->zsze - 1);
++    div64_u64_rem(sector, ns->zsze, &remainder);
++	sector -= remainder;
+ 	while (zone_idx < nr_zones && sector < get_capacity(ns->disk)) {
+ 		memset(report, 0, buflen);
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 12b9dbcc980e..4c6a73989f62 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -697,9 +697,60 @@ static inline unsigned int blk_queue_nr_zones(struct request_queue *q)
+ static inline unsigned int blk_queue_zone_no(struct request_queue *q,
+ 					     sector_t sector)
+ {
++    sector_t zone_sectors = q->disk->queue->limits.chunk_sectors;
+ 	if (!blk_queue_is_zoned(q))
+ 		return 0;
+-	return sector >> ilog2(q->limits.chunk_sectors);
++	if (is_power_of_2(zone_sectors))
++		return sector >> ilog2(zone_sectors);
++	return div64_u64(sector, zone_sectors);
++}
++
++static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
++{
++	return bdev->bd_disk->queue;	/* this is never NULL */
++}
++
++static inline bool bdev_is_zoned(struct block_device *bdev)
++{
++	struct request_queue *q = bdev_get_queue(bdev);
++
++	if (q)
++		return blk_queue_is_zoned(q);
++
++	return false;
++}
++
++static inline sector_t bdev_zone_sectors(struct block_device *bdev)
++{
++	struct request_queue *q = bdev_get_queue(bdev);
++
++	if (q)
++		return blk_queue_zone_sectors(q);
++	return 0;
++}
++
++static inline sector_t bdev_offset_from_zone_start(struct block_device *bdev,
++						   sector_t sec)
++{
++	sector_t zone_sectors = bdev_zone_sectors(bdev);
++	u64 remainder = 0;
++
++	if (!bdev_is_zoned(bdev))
++		return 0;
++
++	if (is_power_of_2(zone_sectors))
++		return sec & (zone_sectors - 1);
++
++	div64_u64_rem(sec, zone_sectors, &remainder);
++	return remainder;
++}
++
++static inline bool bdev_is_zone_aligned(struct block_device *bdev, sector_t sec)
++{
++	if (!bdev_is_zoned(bdev))
++		return false;
++
++	return bdev_offset_from_zone_start(bdev, sec) == 0;
+ }
+ 
+ static inline bool blk_queue_zone_is_seq(struct request_queue *q,
+@@ -894,10 +945,6 @@ blk_status_t errno_to_blk_status(int errno);
+ 
+ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin);
+ 
+-static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+-{
+-	return bdev->bd_disk->queue;	/* this is never NULL */
+-}
+ 
+ /*
+  * The basic unit of block I/O is a sector. It is used in a number of contexts
+@@ -1555,24 +1602,6 @@ static inline enum blk_zoned_model bdev_zoned_model(struct block_device *bdev)
+ 	return BLK_ZONED_NONE;
+ }
+ 
+-static inline bool bdev_is_zoned(struct block_device *bdev)
+-{
+-	struct request_queue *q = bdev_get_queue(bdev);
+-
+-	if (q)
+-		return blk_queue_is_zoned(q);
+-
+-	return false;
+-}
+-
+-static inline sector_t bdev_zone_sectors(struct block_device *bdev)
+-{
+-	struct request_queue *q = bdev_get_queue(bdev);
+-
+-	if (q)
+-		return blk_queue_zone_sectors(q);
+-	return 0;
+-}
+ 
+ static inline unsigned int bdev_max_open_zones(struct block_device *bdev)
+ {
